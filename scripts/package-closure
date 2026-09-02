@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 PRIMARY_STORE_PATH ROOTS_FILE UPSTREAM_REV KERNEL_VERSION REPOSITORY_REV REPOSITORY DESTINATION" >&2
+  exit 2
+}
+
+[[ $# -eq 7 ]] || usage
+
+store_path=$1
+roots_file=$2
+upstream_rev=$3
+kernel_version=$4
+repository_rev=$5
+repository=$6
+destination=$7
+
+for command in jq nix-store realpath sha256sum tar zstd; do
+  command -v "$command" >/dev/null || {
+    echo "required command is unavailable: $command" >&2
+    exit 1
+  }
+done
+
+[[ $store_path == /nix/store/* ]] || {
+  echo "not a Nix store path: $store_path" >&2
+  exit 1
+}
+
+[[ -s $roots_file ]] || {
+  echo "kernel outputs file is empty or unavailable: $roots_file" >&2
+  exit 1
+}
+
+[[ $upstream_rev =~ ^[0-9a-f]{40}$ ]] || {
+  echo "upstream revision must be a full Git commit: $upstream_rev" >&2
+  exit 1
+}
+
+mapfile -t root_paths < <(LC_ALL=C sort -u "$roots_file")
+[[ ${#root_paths[@]} -gt 0 ]] || {
+  echo "the kernel has no output paths" >&2
+  exit 1
+}
+
+for root_path in "${root_paths[@]}"; do
+  [[ $root_path == /nix/store/* ]] || {
+    echo "not a Nix store path: $root_path" >&2
+    exit 1
+  }
+  nix-store --verify-path "$root_path"
+done
+
+printf '%s\n' "${root_paths[@]}" | grep -Fx "$store_path" >/dev/null || {
+  echo "primary store path is not one of the kernel outputs: $store_path" >&2
+  exit 1
+}
+
+mkdir -p "$destination"
+destination=$(realpath "$destination")
+staging=$(mktemp -d "${TMPDIR:-/tmp}/linux-asahi-closure.XXXXXXXX")
+trap 'rm -rf "$staging"' EXIT
+
+mapfile -t closure_paths < <(nix-store --query --requisites "${root_paths[@]}")
+[[ ${#closure_paths[@]} -gt 0 ]] || {
+  echo "the runtime closure is empty" >&2
+  exit 1
+}
+
+printf '%s\n' "${closure_paths[@]}" | LC_ALL=C sort -u >"$staging/closure-paths.txt"
+printf '%s\n' "${root_paths[@]}" >"$staging/kernel-output-paths.txt"
+nix-store --export "${closure_paths[@]}" >"$staging/closure.nix-store-export"
+
+tag="nixos-apple-silicon-$upstream_rev"
+safe_version=${kernel_version//[^A-Za-z0-9._+-]/-}
+short_rev=${upstream_rev:0:12}
+archive_name="linux-asahi-${safe_version}-${short_rev}-aarch64-linux.nix-store-export.tar.zst"
+archive="$destination/$archive_name"
+
+jq -n \
+  --argjson schemaVersion 1 \
+  --arg system "aarch64-linux" \
+  --arg package "linux-asahi" \
+  --arg kernelVersion "$kernel_version" \
+  --arg upstreamRevision "$upstream_rev" \
+  --arg repository "$repository" \
+  --arg repositoryRevision "$repository_rev" \
+  --arg flakeReference "github:$repository/$tag#linux-asahi" \
+  --arg outputStorePath "$store_path" \
+  --rawfile rootStorePaths "$staging/kernel-output-paths.txt" \
+  --rawfile closurePaths "$staging/closure-paths.txt" \
+  '{
+    schemaVersion: $schemaVersion,
+    system: $system,
+    package: $package,
+    kernelVersion: $kernelVersion,
+    upstream: {
+      repository: "nix-community/nixos-apple-silicon",
+      revision: $upstreamRevision
+    },
+    repository: {
+      slug: $repository,
+      revision: $repositoryRevision,
+      flakeReference: $flakeReference
+    },
+    outputStorePath: $outputStorePath,
+    rootStorePaths: ($rootStorePaths | split("\n") | map(select(length > 0))),
+    closurePaths: ($closurePaths | split("\n") | map(select(length > 0)))
+  }' >"$staging/manifest.json"
+
+cat >"$staging/IMPORT.md" <<EOF
+# Importing this Nix closure
+
+Verify the archive using its adjacent \`.sha256\` release asset, then import it:
+
+\`\`\`console
+sha256sum --check $archive_name.sha256
+tar --zstd -xOf $archive_name closure.nix-store-export | sudo nix-store --import
+\`\`\`
+
+The primary imported output is \`$store_path\`. The archive also includes the
+kernel's modules and development outputs. They correspond exactly to:
+
+\`\`\`console
+nix build "github:$repository/$tag#linux-asahi"
+\`\`\`
+
+The archive is a Nix export stream, not a binary substituter. Import it before
+building or evaluating a system pinned to the release tag above.
+EOF
+
+tar \
+  --sort=name \
+  --mtime='@0' \
+  --owner=0 \
+  --group=0 \
+  --numeric-owner \
+  --use-compress-program='zstd -10 -T0' \
+  -C "$staging" \
+  -cf "$archive" \
+  IMPORT.md closure-paths.txt closure.nix-store-export kernel-output-paths.txt manifest.json
+
+(
+  cd "$destination"
+  sha256sum "$archive_name" >"$archive_name.sha256"
+)
+
+printf '%s\n' "$archive"

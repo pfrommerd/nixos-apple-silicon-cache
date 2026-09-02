@@ -1,0 +1,183 @@
+name: Kernel
+
+on:
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - scripts/package-closure
+      - .github/workflows/kernel.yml
+  push:
+    branches:
+      - main
+    paths:
+      - flake.nix
+      - flake.lock
+      - scripts/package-closure
+      - .github/workflows/kernel.yml
+  workflow_dispatch:
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: release-preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.release.outputs.should_build }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      upstream_revision: ${{ steps.metadata.outputs.upstream_revision }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read the locked upstream revision
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          input_node=$(jq -er '.nodes.root.inputs."nixos-apple-silicon"' flake.lock)
+          upstream_revision=$(jq -er --arg node "$input_node" '.nodes[$node].locked.rev' flake.lock)
+          [[ $upstream_revision =~ ^[0-9a-f]{40}$ ]]
+          {
+            echo "upstream_revision=$upstream_revision"
+            echo "tag=nixos-apple-silicon-$upstream_revision"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Decide whether a build is needed
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
+            echo "should_build=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ $GITHUB_REF != refs/heads/main ]]; then
+            echo "Manual release builds must run from the main branch." >&2
+            exit 1
+          fi
+
+          if published=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.draft == false' 2>/dev/null) \
+            && [[ $published == true ]]; then
+            echo "Release $TAG already exists; nothing to build."
+            echo "should_build=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  kernel:
+    name: kernel-build
+    needs: preflight
+    if: needs.preflight.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
+
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@55718cd9ebf1737a061487d5ada21abf31e99a98 # main
+        with:
+          use-flakehub: false
+
+      - name: Check the flake
+        run: nix flake check --print-build-logs
+
+      - name: Build the native AArch64 kernel
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          roots_file="$RUNNER_TEMP/kernel-output-paths.txt"
+          nix build --no-link --print-out-paths --print-build-logs '.#linux-asahi^*' \
+            | LC_ALL=C sort -u \
+            | tee "$roots_file"
+          store_path=$(nix build --no-link --print-out-paths --print-build-logs .#linux-asahi)
+          [[ $store_path == /nix/store/* ]]
+          grep -Fx "$store_path" "$roots_file" >/dev/null
+          {
+            echo "store_path=$store_path"
+            echo "roots_file=$roots_file"
+          } >>"$GITHUB_OUTPUT"
+
+          nix derivation show .#linux-asahi \
+            | jq -e '.derivations | to_entries | all(.value.system == "aarch64-linux")' >/dev/null
+
+      - name: Package and validate the runtime closure
+        id: package
+        env:
+          STORE_PATH: ${{ steps.build.outputs.store_path }}
+          UPSTREAM_REVISION: ${{ needs.preflight.outputs.upstream_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          kernel_version=$(nix eval --raw .#linux-asahi.version)
+          archive=$(bash scripts/package-closure \
+            "$STORE_PATH" \
+            "${{ steps.build.outputs.roots_file }}" \
+            "$UPSTREAM_REVISION" \
+            "$kernel_version" \
+            "$GITHUB_SHA" \
+            "$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/release")
+          checksum="$archive.sha256"
+
+          tar --zstd -xOf "$archive" closure.nix-store-export \
+            | nix-store --import \
+            | grep -Fx "$STORE_PATH"
+          (
+            cd "$(dirname "$archive")"
+            sha256sum --check "$(basename "$checksum")"
+          )
+
+          {
+            echo "archive=$archive"
+            echo "checksum=$checksum"
+            echo "kernel_version=$kernel_version"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Publish the immutable release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          UPSTREAM_REVISION: ${{ needs.preflight.outputs.upstream_revision }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          KERNEL_VERSION: ${{ steps.package.outputs.kernel_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' \
+            "Native AArch64 build of the nixos-apple-silicon linux-asahi kernel." \
+            "" \
+            "- Kernel version: \`$KERNEL_VERSION\`" \
+            "- nixos-apple-silicon revision: \`$UPSTREAM_REVISION\`" \
+            "- Repository revision: \`$GITHUB_SHA\`" \
+            "" \
+            "Verify the checksum and follow \`IMPORT.md\` inside the archive." \
+            >"$notes"
+
+          if ! gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "linux-asahi $KERNEL_VERSION ($UPSTREAM_REVISION)" \
+              --notes-file "$notes"
+          fi
+
+          gh release upload "$TAG" "$ARCHIVE" "$CHECKSUM" --clobber
+          gh release edit "$TAG" --draft=false --latest
